@@ -6410,9 +6410,104 @@ static int nl80211_parse_he_bss_color(struct nlattr *attrs,
 	return 0;
 }
 
+static void nl80211_check_ap_rate_selectors(struct cfg80211_beacon_data *bcn,
+					    const struct element *rates)
+{
+	int i;
+
+	if (!rates)
+		return;
+
+	for (i = 0; i < rates->datalen; i++) {
+		if (rates->data[i] == BSS_MEMBERSHIP_SELECTOR_HT_PHY)
+			bcn->ht_required = true;
+		if (rates->data[i] == BSS_MEMBERSHIP_SELECTOR_VHT_PHY)
+			bcn->vht_required = true;
+	}
+}
+
+/*
+ * Since the nl80211 API didn't include, from the beginning, attributes about
+ * HT/VHT/... operation, we parse them out of the elements and check for
+ * validity for use by drivers/mac80211.
+ */
+static int nl80211_calculate_ap_operation(struct nlattr *attrs[],
+					  struct cfg80211_beacon_data *bcn,
+					  struct netlink_ext_ack *extack)
+{
+	size_t ies_len = bcn->tail_len;
+	const u8 *ies = bcn->tail;
+	const struct element *rates;
+	const struct element *op;
+
+	rates = cfg80211_find_elem(WLAN_EID_SUPP_RATES, ies, ies_len);
+	nl80211_check_ap_rate_selectors(bcn, rates);
+
+	rates = cfg80211_find_elem(WLAN_EID_EXT_SUPP_RATES, ies, ies_len);
+	nl80211_check_ap_rate_selectors(bcn, rates);
+
+	op = cfg80211_find_ext_elem(WLAN_EID_EXT_HE_OPERATION, ies, ies_len);
+	if (op) {
+		if (op->datalen < sizeof(*bcn->he_oper) + 1) {
+			NL_SET_ERR_MSG(extack, "bad HE operation in beacon");
+			return -EINVAL;
+		}
+		bcn->he_oper = (void *)(op->data + 1);
+		/* takes extension ID into account */
+		if (op->datalen < ieee80211_he_oper_size((void *)bcn->he_oper)) {
+			NL_SET_ERR_MSG(extack, "bad HE operation in beacon");
+			return -EINVAL;
+		}
+	}
+
+	op = cfg80211_find_elem(WLAN_EID_HT_OPERATION, ies, ies_len);
+	if (op) {
+		if (op->datalen < sizeof(*bcn->ht_oper)) {
+			NL_SET_ERR_MSG(extack, "bad HT operation in beacon");
+			return -EINVAL;
+		}
+		bcn->ht_oper = (void *)op->data;
+	}
+
+	op = cfg80211_find_elem(WLAN_EID_VHT_OPERATION, ies, ies_len);
+	if (op) {
+		if (op->datalen < sizeof(*bcn->vht_oper)) {
+			NL_SET_ERR_MSG(extack, "bad VHT operation in beacon");
+			return -EINVAL;
+		}
+		bcn->vht_oper = (void *)op->data;
+	}
+
+	op = cfg80211_find_ext_elem(WLAN_EID_EXT_EHT_OPERATION, ies, ies_len);
+	if (op) {
+		if (!ieee80211_eht_oper_size_ok(op->data + 1,
+						op->datalen - 1)) {
+			NL_SET_ERR_MSG(extack, "bad EHT operation in beacon");
+			return -EINVAL;
+		}
+		bcn->eht_oper = (void *)(op->data + 1);
+	}
+
+	op = cfg80211_find_ext_elem(WLAN_EID_EXT_UHR_OPER, ies, ies_len);
+	if (op) {
+		/* need full UHR operation separately */
+		if (!attrs[NL80211_ATTR_UHR_OPERATION]) {
+			NL_SET_ERR_MSG(extack, "missing UHR operation");
+			return -EINVAL;
+		}
+		bcn->uhr_oper = nla_data(attrs[NL80211_ATTR_UHR_OPERATION]);
+	} else if (attrs[NL80211_ATTR_UHR_OPERATION]) {
+		NL_SET_ERR_MSG(extack, "unexpected UHR operation");
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 static int nl80211_parse_beacon(struct cfg80211_registered_device *rdev,
 				struct nlattr *attrs[],
 				struct cfg80211_beacon_data *bcn,
+				struct ieee80211_channel *chan,
 				struct netlink_ext_ack *extack)
 {
 	bool haveinfo = false;
@@ -6526,6 +6621,19 @@ static int nl80211_parse_beacon(struct cfg80211_registered_device *rdev,
 			bcn->rnr_ies = rnr;
 		}
 	}
+
+	err = nl80211_calculate_ap_operation(attrs, bcn, extack);
+	if (err)
+		return err;
+
+	if (bcn->he_oper && (chan->flags & IEEE80211_CHAN_NO_HE))
+		return -EOPNOTSUPP;
+
+	if (bcn->eht_oper && (chan->flags & IEEE80211_CHAN_NO_EHT))
+		return -EOPNOTSUPP;
+
+	if (bcn->uhr_oper && (chan->flags & IEEE80211_CHAN_NO_UHR))
+		return -EOPNOTSUPP;
 
 	return 0;
 }
@@ -6644,22 +6752,6 @@ nl80211_parse_unsol_bcast_probe_resp(struct cfg80211_registered_device *rdev,
 	return 0;
 }
 
-static void nl80211_check_ap_rate_selectors(struct cfg80211_beacon_data *bcn,
-					    const struct element *rates)
-{
-	int i;
-
-	if (!rates)
-		return;
-
-	for (i = 0; i < rates->datalen; i++) {
-		if (rates->data[i] == BSS_MEMBERSHIP_SELECTOR_HT_PHY)
-			bcn->ht_required = true;
-		if (rates->data[i] == BSS_MEMBERSHIP_SELECTOR_VHT_PHY)
-			bcn->vht_required = true;
-	}
-}
-
 /*
  * Since the nl80211 API didn't include, from the beginning, attributes about
  * HT/VHT/... capabilities, we parse them out of the elements and check for
@@ -6709,89 +6801,6 @@ static int nl80211_calculate_ap_capabilities(struct genl_info *info,
 			return -EINVAL;
 		}
 	}
-
-	return 0;
-}
-
-/*
- * Since the nl80211 API didn't include, from the beginning, attributes about
- * HT/VHT/... operation, we parse them out of the elements and check for
- * validity for use by drivers/mac80211.
- */
-static int nl80211_calculate_ap_operation(struct genl_info *info,
-					  struct cfg80211_beacon_data *bcn)
-{
-	size_t ies_len = bcn->tail_len;
-	const u8 *ies = bcn->tail;
-	const struct element *rates;
-	const struct element *op;
-
-	rates = cfg80211_find_elem(WLAN_EID_SUPP_RATES, ies, ies_len);
-	nl80211_check_ap_rate_selectors(bcn, rates);
-
-	rates = cfg80211_find_elem(WLAN_EID_EXT_SUPP_RATES, ies, ies_len);
-	nl80211_check_ap_rate_selectors(bcn, rates);
-
-	op = cfg80211_find_ext_elem(WLAN_EID_EXT_HE_OPERATION, ies, ies_len);
-	if (op) {
-		if (op->datalen < sizeof(*bcn->he_oper) + 1) {
-			GENL_SET_ERR_MSG(info, "bad HE operation in beacon");
-			return -EINVAL;
-		}
-		bcn->he_oper = (void *)(op->data + 1);
-		/* takes extension ID into account */
-		if (op->datalen < ieee80211_he_oper_size((void *)bcn->he_oper)) {
-			GENL_SET_ERR_MSG(info, "bad HE operation in beacon");
-			return -EINVAL;
-		}
-	}
-
-	op = cfg80211_find_elem(WLAN_EID_HT_OPERATION, ies, ies_len);
-	if (op) {
-		if (op->datalen < sizeof(*bcn->ht_oper)) {
-			GENL_SET_ERR_MSG(info, "bad HT operation in beacon");
-			return -EINVAL;
-		}
-		bcn->ht_oper = (void *)op->data;
-	}
-
-	op = cfg80211_find_elem(WLAN_EID_VHT_OPERATION, ies, ies_len);
-	if (op) {
-		if (op->datalen < sizeof(*bcn->vht_oper)) {
-			GENL_SET_ERR_MSG(info, "bad VHT operation in beacon");
-			return -EINVAL;
-		}
-		bcn->vht_oper = (void *)op->data;
-	}
-
-	op = cfg80211_find_ext_elem(WLAN_EID_EXT_EHT_OPERATION, ies, ies_len);
-	if (op) {
-		if (!ieee80211_eht_oper_size_ok(op->data + 1,
-						op->datalen - 1)) {
-			GENL_SET_ERR_MSG(info, "bad EHT operation in beacon");
-			return -EINVAL;
-		}
-		bcn->eht_oper = (void *)(op->data + 1);
-	}
-
-	op = cfg80211_find_ext_elem(WLAN_EID_EXT_UHR_OPER, ies, ies_len);
-	if (op) {
-		/* need full UHR operation separately */
-		if (!info->attrs[NL80211_ATTR_UHR_OPERATION]) {
-			GENL_SET_ERR_MSG(info, "missing UHR operation");
-			return -EINVAL;
-		}
-		bcn->uhr_oper = nla_data(info->attrs[NL80211_ATTR_UHR_OPERATION]);
-	} else if (info->attrs[NL80211_ATTR_UHR_OPERATION]) {
-		GENL_SET_ERR_MSG(info, "unexpected UHR operation");
-		return -EINVAL;
-	}
-
-	if (!!params->he_cap != !!params->he_oper)
-		return -EINVAL;
-
-	if (!!params->eht_cap != !!params->eht_oper)
-		return -EINVAL;
 
 	return 0;
 }
@@ -6920,21 +6929,6 @@ out:
 	nlmsg_free(msg);
 }
 
-static int nl80211_validate_ap_phy_operation(struct ieee80211_channel *channel,
-					     struct cfg80211_beacon_data *bcn)
-{
-	if (bcn->he_oper && (channel->flags & IEEE80211_CHAN_NO_HE))
-		return -EOPNOTSUPP;
-
-	if (bcn->eht_oper && (channel->flags & IEEE80211_CHAN_NO_EHT))
-		return -EOPNOTSUPP;
-
-	if (bcn->uhr_oper && (channel->flags & IEEE80211_CHAN_NO_UHR))
-		return -EOPNOTSUPP;
-
-	return 0;
-}
-
 static int
 nl80211_parse_s1g_short_beacon(struct cfg80211_registered_device *rdev,
 			       struct nlattr *attrs,
@@ -7006,11 +7000,6 @@ static int nl80211_start_ap(struct sk_buff *skb, struct genl_info *info)
 	params = kzalloc(sizeof(*params), GFP_KERNEL);
 	if (!params)
 		return -ENOMEM;
-
-	err = nl80211_parse_beacon(rdev, info->attrs, &params->beacon,
-				   info->extack);
-	if (err)
-		goto out;
 
 	params->beacon_interval =
 		nla_get_u32(info->attrs[NL80211_ATTR_BEACON_INTERVAL]);
@@ -7128,6 +7117,11 @@ static int nl80211_start_ap(struct sk_buff *skb, struct genl_info *info)
 		goto out;
 	}
 
+	err = nl80211_parse_beacon(rdev, info->attrs, &params->beacon,
+				   params->chandef.chan, info->extack);
+	if (err)
+		goto out;
+
 	beacon_check.iftype = wdev->iftype;
 	beacon_check.relax = true;
 	beacon_check.reg_power =
@@ -7231,15 +7225,6 @@ static int nl80211_start_ap(struct sk_buff *skb, struct genl_info *info)
 	if (err)
 		goto out;
 
-	err = nl80211_calculate_ap_operation(info, &params->beacon);
-	if (err)
-		goto out;
-
-	err = nl80211_validate_ap_phy_operation(params->chandef.chan,
-						&params->beacon);
-	if (err)
-		goto out;
-
 	if (info->attrs[NL80211_ATTR_AP_SETTINGS_FLAGS])
 		params->flags = nla_get_u32(
 			info->attrs[NL80211_ATTR_AP_SETTINGS_FLAGS]);
@@ -7307,16 +7292,8 @@ static int nl80211_set_beacon(struct sk_buff *skb, struct genl_info *info)
 		return -ENOMEM;
 
 	err = nl80211_parse_beacon(rdev, info->attrs, &params->beacon,
+				   wdev->links[link_id].ap.chandef.chan,
 				   info->extack);
-	if (err)
-		goto out;
-
-	err = nl80211_calculate_ap_operation(info, &params->beacon);
-	if (err)
-		goto out;
-
-	err = nl80211_validate_ap_phy_operation(wdev->links[link_id].ap.chandef.chan,
-						&params->beacon);
 	if (err)
 		goto out;
 
@@ -11920,11 +11897,16 @@ static int nl80211_channel_switch(struct sk_buff *skb, struct genl_info *info)
 
 	params.count = cs_count;
 
+	err = nl80211_parse_chandef(rdev, info->extack, info->attrs,
+				    &params.chandef);
+	if (err)
+		goto free;
+
 	if (!need_new_beacon)
 		goto skip_beacons;
 
 	err = nl80211_parse_beacon(rdev, info->attrs, &params.beacon_after,
-				   info->extack);
+				   params.chandef.chan, info->extack);
 	if (err)
 		goto free;
 
@@ -11942,6 +11924,7 @@ static int nl80211_channel_switch(struct sk_buff *skb, struct genl_info *info)
 		goto free;
 
 	err = nl80211_parse_beacon(rdev, csa_attrs, &params.beacon_csa,
+				   wdev->links[link_id].ap.chandef.chan,
 				   info->extack);
 	if (err)
 		goto free;
@@ -11970,11 +11953,6 @@ static int nl80211_channel_switch(struct sk_buff *skb, struct genl_info *info)
 		goto free;
 
 skip_beacons:
-	err = nl80211_parse_chandef(rdev, info->extack, info->attrs,
-				    &params.chandef);
-	if (err)
-		goto free;
-
 	if (!cfg80211_reg_can_beacon_relax(&rdev->wiphy, &params.chandef,
 					   wdev->iftype)) {
 		err = -EINVAL;
@@ -18448,6 +18426,7 @@ static int nl80211_color_change(struct sk_buff *skb, struct genl_info *info)
 	params.color = nla_get_u8(info->attrs[NL80211_ATTR_COLOR_CHANGE_COLOR]);
 
 	err = nl80211_parse_beacon(rdev, info->attrs, &params.beacon_next,
+				   wdev->links[params.link_id].ap.chandef.chan,
 				   info->extack);
 	if (err)
 		return err;
@@ -18463,6 +18442,7 @@ static int nl80211_color_change(struct sk_buff *skb, struct genl_info *info)
 		goto out;
 
 	err = nl80211_parse_beacon(rdev, tb, &params.beacon_color_change,
+				   wdev->links[params.link_id].ap.chandef.chan,
 				   info->extack);
 	if (err)
 		goto out;

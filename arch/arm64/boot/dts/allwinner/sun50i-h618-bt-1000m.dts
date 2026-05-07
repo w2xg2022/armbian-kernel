@@ -84,25 +84,6 @@
 	};
 };
 
-&emac1 {
-	pinctrl-names = "default";
-	pinctrl-0 = <&rmii_pins>;
-	phy-mode = "rmii";
-	phy-handle = <&rmii_phy>;
-	phy-supply = <&reg_aldo1>;
-	allwinner,rx-delay-ps = <3100>;
-	allwinner,tx-delay-ps = <700>;
-	status = "okay";
-};
-
-&mdio1 {
-	rmii_phy: ethernet-phy@0 {
-		compatible = "ethernet-phy-ieee802.3-c22";
-		reg = <0>;
-	};
-};
-
-
 &mmc2 {
 	vmmc-supply = <&reg_dldo1>;
 	vqmmc-supply = <&reg_aldo1>;

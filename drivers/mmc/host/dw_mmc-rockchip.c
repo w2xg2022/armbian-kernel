@@ -627,11 +627,10 @@ static const struct dev_pm_ops dw_mci_rockchip_dev_pm_ops = {
 static void dw_mci_rockchip_shutdown(struct platform_device *pdev)
 {
 	struct dw_mci *host = dev_get_drvdata(&pdev->dev);
-	struct mmc_host *mmc = host->slot->mmc;
+	struct mmc_host *mmc = host->mmc;
 
-	if (!IS_ERR(mmc->supply.vqmmc) && !(host->vqmmc_enabled))
-		if(!regulator_enable(mmc->supply.vqmmc))
-			host->vqmmc_enabled = true;
+	if (!IS_ERR(mmc->supply.vqmmc) && !regulator_is_enabled(mmc->supply.vqmmc))
+		regulator_enable(mmc->supply.vqmmc);
 }
 
 static struct platform_driver dw_mci_rockchip_pltfm_driver = {

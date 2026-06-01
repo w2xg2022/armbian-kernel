@@ -19,6 +19,12 @@
 		rtc1 = &vrtc;
 	};
 
+	reboot: meson64-reboot {
+		compatible = "meson64,reboot";
+		sys_reset = <0x84000009>;
+		sys_poweroff = <0x84000008>;
+	};
+
 	gpio-keys-polled {
 		compatible = "gpio-keys-polled";
 		#address-cells = <1>;

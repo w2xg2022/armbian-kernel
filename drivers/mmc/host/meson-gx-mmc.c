@@ -19,6 +19,8 @@
 #include <linux/mmc/mmc.h>
 #include <linux/mmc/sdio.h>
 #include <linux/mmc/slot-gpio.h>
+#include <linux/mmc/sdio_func.h>
+#include <linux/mmc/card.h>
 #include <linux/io.h>
 #include <linux/clk.h>
 #include <linux/clk-provider.h>
@@ -1125,6 +1127,114 @@ static const struct mmc_host_ops meson_mmc_ops = {
 	.start_signal_voltage_switch = meson_mmc_voltage_switch,
 };
 
+/* ---- Amlogic vendor SDIO WiFi glue (ported from CoreELEC common_drivers 5.15) ----
+ * The UWE5621 wifi BSP driver (uwe5631-aml) externs these symbols. Upstream
+ * meson-gx-mmc does not provide them; without sdio_reinit the wifi chip cannot
+ * be re-enumerated after power-cycle and probe fails with -110.
+ */
+struct mmc_host *sdio_host;
+
+static void sdio_rescan(struct mmc_host *mmc)
+{
+	int ret;
+
+	mmc->rescan_entered = 0;
+	mmc_detect_change(mmc, 0);
+	/* start the delayed_work */
+	ret = flush_work(&mmc->detect.work);
+	/* wait for the delayed_work to finish */
+	if (!ret)
+		pr_info("Error: delayed_work mmc_rescan() already idle!\n");
+}
+
+void sdio_reset_comm(struct mmc_card *card)
+{
+	struct mmc_host *host = card->host;
+	int i = 0, err = 0;
+
+	while (i < SDIO_MAX_FUNCS && !card->sdio_func[i])
+		i++;
+	if (WARN_ON(i == SDIO_MAX_FUNCS))
+		return;
+	sdio_claim_host(card->sdio_func[i]);
+	err = mmc_sw_reset(host);
+	sdio_release_host(card->sdio_func[i]);
+	if (err)
+		pr_info("%s Failed, error = %d\n", __func__, err);
+}
+EXPORT_SYMBOL(sdio_reset_comm);
+
+void sdio_reinit(void)
+{
+	if (sdio_host) {
+		struct mmc_ios *ios = &sdio_host->ios;
+
+		if (sdio_host->card) {
+			ios->timing = 0;
+			sdio_reset_comm(sdio_host->card);
+		} else {
+			sdio_rescan(sdio_host);
+		}
+	} else {
+		pr_info("Error: sdio_host is NULL\n");
+	}
+
+	pr_debug("[%s] finish\n", __func__);
+}
+EXPORT_SYMBOL(sdio_reinit);
+
+void sdio_clk_always_on(bool clk_aws_on)
+{
+	struct meson_host *host = NULL;
+	u32 conf = 0;
+
+	if (sdio_host) {
+		host = mmc_priv(sdio_host);
+		conf = readl(host->regs + SD_EMMC_CFG);
+		if (clk_aws_on)
+			conf &= ~CFG_AUTO_CLK;
+		else
+			conf |= CFG_AUTO_CLK;
+		writel(conf, host->regs + SD_EMMC_CFG);
+	} else {
+		pr_info("Error: sdio_host is NULL\n");
+	}
+}
+EXPORT_SYMBOL(sdio_clk_always_on);
+
+void sdio_set_max_regs(unsigned int size)
+{
+	if (sdio_host) {
+		sdio_host->max_req_size = size;
+		sdio_host->max_seg_size = sdio_host->max_req_size;
+	} else {
+		pr_info("Error: sdio_host is NULL\n");
+	}
+}
+EXPORT_SYMBOL(sdio_set_max_regs);
+
+/* tells wifi driver which host (sd/sdio) it is on */
+const char *get_wifi_inf(void)
+{
+	if (sdio_host)
+		return mmc_hostname(sdio_host);
+	else
+		return "sdio";
+}
+EXPORT_SYMBOL(get_wifi_inf);
+
+int sdio_get_vendor(void)
+{
+	int vendor = 0;
+
+	if (sdio_host && sdio_host->card)
+		vendor = sdio_host->card->cis.vendor;
+
+	return vendor;
+}
+EXPORT_SYMBOL(sdio_get_vendor);
+/* ---- end Amlogic SDIO WiFi glue ---- */
+
 static int meson_mmc_probe(struct platform_device *pdev)
 {
 	struct resource *res;
@@ -1287,6 +1397,15 @@ static int meson_mmc_probe(struct platform_device *pdev)
 	ret = mmc_add_host(mmc);
 	if (ret)
 		goto err_free_irq;
+
+	/*
+	 * Amlogic SDIO WiFi: remember the SDIO controller as the wifi host so
+	 * sdio_reinit()/sdio_clk_always_on() can act on it. On G12A the SDIO
+	 * controller (where the UWE5621 wifi sits) is the one that sets
+	 * amlogic,dram-access-quirk; the eMMC controller does not.
+	 */
+	if (host->dram_access_quirk)
+		sdio_host = mmc;
 
 	return 0;
 

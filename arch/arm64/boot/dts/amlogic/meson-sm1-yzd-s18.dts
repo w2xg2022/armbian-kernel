@@ -57,13 +57,6 @@
 /* No 40-pin header */
 &gpio {
 	/delete-property/ gpio-line-names;
-
-	usb-hub-hog {
-		gpio-hog;
-		gpios = <GPIOH_4 GPIO_ACTIVE_HIGH>;
-		output-high;
-		line-name = "usb-hub-reset";
-	};
 };
 
 &gpio_ao {

@@ -50,6 +50,10 @@
 	/delete-property/ reset-gpios;
 };
 
+&ir {
+	linux,rc-map-name = "rc-yzd-s18";
+};
+
 /* No 40-pin header */
 &gpio {
 	/delete-property/ gpio-line-names;

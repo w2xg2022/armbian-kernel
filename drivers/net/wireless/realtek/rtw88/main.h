@@ -377,6 +377,7 @@ enum rtw_flags {
 	RTW_FLAG_RESTARTING,
 	RTW_FLAG_RESTART_TRIGGERING,
 	RTW_FLAG_FORCE_LOWEST_RATE,
+	RTW_FLAG_SWITCHING_USB_MODE,
 
 	NUM_OF_RTW_FLAGS,
 };
@@ -1963,6 +1964,7 @@ struct rtw_sar {
 
 struct rtw_hal {
 	u32 rcr;
+	u16 rxfltmap1;
 
 	u32 chip_version;
 	u8 cut_version;

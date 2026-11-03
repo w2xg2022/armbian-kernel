@@ -2685,6 +2685,31 @@ int genphy_read_abilities(struct phy_device *phydev)
 }
 EXPORT_SYMBOL(genphy_read_abilities);
 
+/* Some PHYs support direct C45 register access but not C22 indirect
+ * MMD access (registers 13 and 14). When discovered via C22, phylib
+ * routes MMD access through the indirect path, which won't work on
+ * these devices. These helpers bypass indirect access and use the bus
+ * C45 accessors directly.
+ */
+int genphy_read_mmd_c45(struct phy_device *phydev, int devnum, u16 regnum)
+{
+	struct mii_bus *bus = phydev->mdio.bus;
+	int addr = phydev->mdio.addr;
+
+	return __mdiobus_c45_read(bus, addr, devnum, regnum);
+}
+EXPORT_SYMBOL(genphy_read_mmd_c45);
+
+int genphy_write_mmd_c45(struct phy_device *phydev, int devnum, u16 regnum,
+			 u16 val)
+{
+	struct mii_bus *bus = phydev->mdio.bus;
+	int addr = phydev->mdio.addr;
+
+	return __mdiobus_c45_write(bus, addr, devnum, regnum, val);
+}
+EXPORT_SYMBOL(genphy_write_mmd_c45);
+
 /* This is used for the phy device which doesn't support the MMD extended
  * register access, but it does have side effect when we are trying to access
  * the MMD register via indirect method.
@@ -3222,6 +3247,16 @@ static int of_phy_led(struct phy_device *phydev,
 		return err;
 	if (index > U8_MAX)
 		return -EINVAL;
+
+	/*
+	 * Some PHY drivers describe their LEDs completely with private
+	 * device tree properties and program the hardware themselves.  Do
+	 * not register a generic LED class device for those, otherwise the
+	 * netdev LED trigger would take over and fight with the driver.
+	 */
+	if (phydev->drv->led_dt_managed &&
+	    phydev->drv->led_dt_managed(phydev, index))
+		return 0;
 
 	if (of_property_read_bool(led, "active-high"))
 		set_bit(PHY_LED_ACTIVE_HIGH, &modes);

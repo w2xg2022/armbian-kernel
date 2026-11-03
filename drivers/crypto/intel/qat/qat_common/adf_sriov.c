@@ -95,10 +95,6 @@ static int adf_enable_sriov(struct adf_accel_dev *accel_dev)
 	if (pci_num_vf(pdev))
 		return 0;
 
-	/* Do not enable SR-IOV if already enabled */
-	if (pci_num_vf(pdev))
-		return 0;
-
 	/*
 	 * Due to the hardware design, when SR-IOV and the ring arbiter
 	 * are enabled all the VFs supported in hardware must be enabled in

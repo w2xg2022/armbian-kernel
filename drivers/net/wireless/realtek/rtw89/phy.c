@@ -2071,7 +2071,10 @@ static void rtw89_phy_init_rf_nctl(struct rtw89_dev *rtwdev)
 	rtw89_phy_preinit_rf_nctl(rtwdev);
 
 	nctl_table = elm_info->rf_nctl ? elm_info->rf_nctl : chip->nctl_table;
+
+	rtw89_io_pack(rtwdev);
 	rtw89_phy_init_reg(rtwdev, nctl_table, false, rtw89_phy_config_bb_reg, NULL);
+	rtw89_io_unpack(rtwdev);
 
 	if (chip->nctl_post_table)
 		rtw89_rfk_parser(rtwdev, chip->nctl_post_table);
@@ -3221,6 +3224,17 @@ static void rtw89_phy_set_txpwr_limit_ru_ax(struct rtw89_dev *rtwdev,
 	}
 }
 
+static int get_max_agg_wait(struct ieee80211_link_sta *link_sta, u16 amsdu_len)
+{
+	struct ieee80211_sta *sta = link_sta->sta;
+	int max_agg_wait = amsdu_len / 1500 - 1;
+
+	if (sta->max_amsdu_subframes)
+		max_agg_wait = min(max_agg_wait, sta->max_amsdu_subframes - 1);
+
+	return max_agg_wait;
+}
+
 struct rtw89_phy_iter_ra_data {
 	struct rtw89_dev *rtwdev;
 	struct sk_buff *c2h;
@@ -3345,7 +3359,7 @@ static void __rtw89_phy_c2h_ra_rpt_iter(struct rtw89_sta_link *rtwsta_link,
 		*changed = true;
 	}
 
-	rtwsta_link->max_agg_wait = link_sta->agg.max_rc_amsdu_len / 1500 - 1;
+	rtwsta_link->max_agg_wait = get_max_agg_wait(link_sta, amsdu_len);
 }
 
 static void rtw89_phy_c2h_ra_rpt_iter(void *data, struct ieee80211_sta *sta)
@@ -8701,8 +8715,8 @@ static void rtw89_phy_edcca_log(struct rtw89_dev *rtwdev, struct rtw89_bb_ctx *b
 	rtw89_phy_write32_mask(rtwdev, edcca_p_regs->rpt_sel,
 			       edcca_p_regs->rpt_sel_mask, 0);
 	if (rtwdev->chip->chip_id == RTL8922A || rtwdev->chip->chip_id == RTL8922D) {
-		rtw89_phy_write32_mask(rtwdev, edcca_regs->rpt_sel_be,
-				       edcca_regs->rpt_sel_be_mask, 0);
+		rtw89_phy_write32_idx(rtwdev, edcca_regs->rpt_sel_be,
+				      edcca_regs->rpt_sel_be_mask, 0, bb->phy_idx);
 		per20_bitmap = rtw89_phy_read32_mask(rtwdev, edcca_p_regs->rpt_a,
 						     MASKBYTE0);
 	}
@@ -8727,16 +8741,16 @@ static void rtw89_phy_edcca_log(struct rtw89_dev *rtwdev, struct rtw89_bb_ctx *b
 	pwdb_s40 = u32_get_bits(tmp, MASKBYTE2);
 
 	if (rtwdev->chip->chip_id == RTL8922A || rtwdev->chip->chip_id == RTL8922D) {
-		rtw89_phy_write32_mask(rtwdev, edcca_regs->rpt_sel_be,
-				       edcca_regs->rpt_sel_be_mask, 4);
+		rtw89_phy_write32_idx(rtwdev, edcca_regs->rpt_sel_be,
+				      edcca_regs->rpt_sel_be_mask, 4, bb->phy_idx);
 		tmp = rtw89_phy_read32(rtwdev, edcca_p_regs->rpt_b);
 		pwdb[0] = u32_get_bits(tmp, MASKBYTE3);
 		pwdb[1] = u32_get_bits(tmp, MASKBYTE2);
 		pwdb[2] = u32_get_bits(tmp, MASKBYTE1);
 		pwdb[3] = u32_get_bits(tmp, MASKBYTE0);
 
-		rtw89_phy_write32_mask(rtwdev, edcca_regs->rpt_sel_be,
-				       edcca_regs->rpt_sel_be_mask, 5);
+		rtw89_phy_write32_idx(rtwdev, edcca_regs->rpt_sel_be,
+				      edcca_regs->rpt_sel_be_mask, 5, bb->phy_idx);
 		tmp = rtw89_phy_read32(rtwdev, edcca_p_regs->rpt_b);
 		pwdb[4] = u32_get_bits(tmp, MASKBYTE3);
 		pwdb[5] = u32_get_bits(tmp, MASKBYTE2);

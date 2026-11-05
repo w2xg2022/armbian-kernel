@@ -14,12 +14,12 @@
 #include "sar.h"
 #include "util.h"
 
-#define RTW8922D_FW_FORMAT_MAX 0
+#define RTW8922D_FW_FORMAT_MAX 1
 #define RTW8922D_FW_BASENAME "rtw89/rtw8922d_fw"
 #define RTW8922D_MODULE_FIRMWARE \
 	RTW89_GEN_MODULE_FWNAME(RTW8922D_FW_BASENAME, RTW8922D_FW_FORMAT_MAX)
 
-#define RTW8922DS_FW_FORMAT_MAX 0
+#define RTW8922DS_FW_FORMAT_MAX 1
 #define RTW8922DS_FW_BASENAME "rtw89/rtw8922ds_fw"
 #define RTW8922DS_MODULE_FIRMWARE \
 	RTW89_GEN_MODULE_FWNAME(RTW8922DS_FW_BASENAME, RTW8922DS_FW_FORMAT_MAX)
@@ -271,7 +271,7 @@ static const struct rtw89_edcca_regs rtw8922d_edcca_regs = {
 		.rpt_sel_mask		= B_EDCCA_RPT_SEL_BE4_MSK,
 	}, {
 		.rpt_a			= R_EDCCA_RPT_A_BE4_C1,
-		.rpt_b			= R_EDCCA_RPT_A_BE4_C1,
+		.rpt_b			= R_EDCCA_RPT_B_BE4_C1,
 		.rpt_sel		= R_EDCCA_RPT_SEL_BE4_C1,
 		.rpt_sel_mask		= B_EDCCA_RPT_SEL_BE4_MSK,
 	}},
@@ -1320,7 +1320,7 @@ static int rtw8922d_ctrl_sco_cck(struct rtw89_dev *rtwdev,
 {
 	u8 ch_element;
 
-	if (primary_ch >= 14)
+	if (primary_ch > 14 || unlikely(primary_ch == 0))
 		return -EINVAL;
 
 	ch_element = primary_ch - 1;
@@ -3305,7 +3305,7 @@ static void rtw8922d_btc_set_rfe(struct rtw89_dev *rtwdev)
 		if (is_bt_share) { /* WL-S0 + (WL-S1 & BT0-S1) */
 			md->ant.type = BTC_ANT_SHARED;
 			md->bt0_pos = BTC_BT_BTG;
-			md->bt0_sw_type = BTC_SWITCH_INTERNAL;
+			md->bt0_sw_type = BTC_SWITCH_V1_INTERNAL;
 			dm->ant_xmap[BTC_RF_S1][BTC_BT_1ST] = 1;
 		} else { /* WL-S0 + BT0-S1 */
 			md->ant.type = BTC_ANT_DEDICATED;
@@ -3336,7 +3336,6 @@ static void rtw8922d_btc_set_rfe(struct rtw89_dev *rtwdev)
 			md->bt0_pos = BTC_BT_BTG;
 			md->bt0_sw_type = BTC_SWITCH_V1_INTERNAL;
 			dm->ant_xmap[BTC_RF_S1][BTC_BT_1ST] = 1;
-			dm->wl_trx_nss_en = 1; /* 1ss MIMO-PS capability */
 		} else {
 			md->ant.func[0] = BTC_EFMAP_NONE;
 			md->ant.func[1] = BTC_EFMAP_NONE;
@@ -3712,7 +3711,7 @@ static const struct rtw89_chip_ops rtw8922d_chip_ops = {
 	.h2c_punctured_cmac_tbl	= rtw89_fw_h2c_punctured_cmac_tbl_be,
 	.h2c_default_dmac_tbl	= rtw89_fw_h2c_default_dmac_tbl_v3,
 	.h2c_update_beacon	= rtw89_fw_h2c_update_beacon_be,
-	.h2c_ba_cam		= rtw89_fw_h2c_ba_cam_v1,
+	.h2c_ba_cam		= rtw89_fw_h2c_ba_cam_g7,
 	.h2c_wow_cam_update	= rtw89_fw_h2c_wow_cam_update_v1,
 
 	.btc_set_rfe		= rtw8922d_btc_set_rfe,
@@ -3807,7 +3806,7 @@ const struct rtw89_chip_info rtw8922d_chip_info = {
 	.scam_num		= 32,
 	.bacam_num		= 24,
 	.bacam_dynamic_num	= 8,
-	.bacam_ver		= RTW89_BACAM_V1,
+	.bacam_ver		= RTW89_BACAM_G7,
 	.addrcam_ver		= 1,
 	.ppdu_max_usr		= 16,
 	.sec_ctrl_efuse_size	= 4,

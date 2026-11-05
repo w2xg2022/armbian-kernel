@@ -15,6 +15,15 @@
 	compatible = "amlogic,sm1";
 	model = "YZD-S18";
 
+	/*
+	 * The stock vendor U-Boot does not fix up memory@0 when booting with
+	 * booti, so the 1GB value from meson-sm1-odroid.dtsi would stay in place.
+	 * Upper limit as reported by the vendor Android firmware on this board.
+	 */
+	memory@0 {
+		reg = <0x0 0x0 0x0 0xf5800000>;
+	};
+
 	leds {
 		compatible = "gpio-leds";
 
@@ -63,7 +72,7 @@
 	/delete-property/ gpio-line-names;
 };
 
-/* SD card: UHS modes are unstable, run at 3.3V high-speed only */
+/* TF slot (not populated by default): only 3.3V is available, so no UHS modes */
 &sd_emmc_b {
 	max-frequency = <25000000>;
 	/delete-property/ sd-uhs-sdr12;

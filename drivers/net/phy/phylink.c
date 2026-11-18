@@ -28,6 +28,7 @@ enum {
 	PHYLINK_DISABLE_STOPPED,
 	PHYLINK_DISABLE_LINK,
 	PHYLINK_DISABLE_MAC_WOL,
+	PHYLINK_DISABLE_REPLAY,
 
 	PCS_STATE_DOWN = 0,
 	PCS_STATE_STARTING,
@@ -77,6 +78,7 @@ struct phylink {
 
 	bool link_failed;
 	bool suspend_link_up;
+	bool force_major_config;
 	bool major_config_failed;
 	bool mac_supports_eee_ops;
 	bool mac_supports_eee;
@@ -1684,18 +1686,18 @@ static void phylink_resolve(struct work_struct *w)
 	if (pl->act_link_an_mode != MLO_AN_FIXED)
 		phylink_apply_manual_flow(pl, &link_state);
 
-	if (mac_config) {
-		if (link_state.interface != pl->link_config.interface) {
-			/* The interface has changed, force the link down and
-			 * then reconfigure.
-			 */
-			if (cur_link_state) {
-				phylink_link_down(pl);
-				cur_link_state = false;
-			}
-			phylink_major_config(pl, false, &link_state);
-			pl->link_config.interface = link_state.interface;
+	if ((mac_config && link_state.interface != pl->link_config.interface) ||
+	    pl->force_major_config) {
+		/* The interface has changed or a forced major configuration
+		 * was requested, so force the link down and then reconfigure.
+		 */
+		if (cur_link_state) {
+			phylink_link_down(pl);
+			cur_link_state = false;
 		}
+		phylink_major_config(pl, false, &link_state);
+		pl->link_config.interface = link_state.interface;
+		pl->force_major_config = false;
 	}
 
 	/* If configuration of the interface failed, force the link down
@@ -1818,6 +1820,126 @@ int phylink_set_fixed_link(struct phylink *pl,
 	return 0;
 }
 EXPORT_SYMBOL_GPL(phylink_set_fixed_link);
+
+/**
+ * phylink_update_pause_state() - Update the phylink pause frame configuration
+ * @pl: a pointer to a &struct phylink instance
+ * @pause_state: bitmask indicating the new pause state
+ *
+ * Update the MAC pause frame (flow control) state for the phylink instance.
+ */
+static void phylink_update_pause_state(struct phylink *pl, int pause_state)
+{
+	struct phylink_link_state *config = &pl->link_config;
+	bool tx_pause = !!(pause_state & MLO_PAUSE_TX);
+	bool rx_pause = !!(pause_state & MLO_PAUSE_RX);
+	bool manual_changed;
+
+	mutex_lock(&pl->state_mutex);
+
+	/*
+	 * See the comments for linkmode_set_pause(), wrt the deficiencies
+	 * with the current implementation.  A solution to this issue would
+	 * be:
+	 * ethtool  Local device
+	 *  rx  tx  Pause AsymDir
+	 *  0   0   0     0
+	 *  1   0   1     1
+	 *  0   1   0     1
+	 *  1   1   1     1
+	 * and then use the ethtool rx/tx enablement status to mask the
+	 * rx/tx pause resolution.
+	 */
+	linkmode_set_pause(config->advertising, tx_pause,
+			   rx_pause);
+
+	manual_changed = (config->pause ^ pause_state) & MLO_PAUSE_AN ||
+			 (!(pause_state & MLO_PAUSE_AN) &&
+			   (config->pause ^ pause_state) & MLO_PAUSE_TXRX_MASK);
+
+	config->pause = pause_state;
+
+	/* Update our in-band advertisement, triggering a renegotiation if
+	 * the advertisement changed.
+	 */
+	if (!pl->phydev)
+		phylink_change_inband_advert(pl);
+
+	mutex_unlock(&pl->state_mutex);
+
+	/* If we have a PHY, a change of the pause frame advertisement will
+	 * cause phylib to renegotiate (if AN is enabled) which will in turn
+	 * call our phylink_phy_change() and trigger a resolve.  Note that
+	 * we can't hold our state mutex while calling phy_set_asym_pause().
+	 */
+	if (pl->phydev)
+		phy_set_asym_pause(pl->phydev, rx_pause, tx_pause);
+
+	/* If the manual pause settings changed, make sure we trigger a
+	 * resolve to update their state; we can not guarantee that the
+	 * link will cycle.
+	 */
+	if (manual_changed) {
+		pl->link_failed = true;
+		phylink_run_resolve(pl);
+	}
+}
+
+/**
+ * phylink_update_mac_pause_capabilities() - Dynamically update MAC pause
+ * @pl: a pointer to a &struct phylink returned from phylink_create()
+ * @mac_pause: the new MAC pause capabilities mask
+ *
+ * This function allows a MAC driver to dynamically change its pause state,
+ * such as losing/gaining Pause frame support based on MTU size.
+ * It recalculates supported link modes and triggers renegotiation if needed.
+ */
+void phylink_update_mac_pause_capabilities(struct phylink *pl, unsigned long mac_pause)
+{
+	struct phylink_link_state *config = &pl->link_config;
+	unsigned long old_pause;
+	int pause_state;
+
+	ASSERT_RTNL();
+
+	if (mac_pause & ~(MAC_SYM_PAUSE | MAC_ASYM_PAUSE)) {
+		phylink_err(pl, "Attempted to dynamically change non-pause MAC capabilities\n");
+		return;
+	}
+
+	old_pause = pl->config->mac_capabilities & (MAC_SYM_PAUSE | MAC_ASYM_PAUSE);
+	if (old_pause == mac_pause)
+		return;
+
+	mutex_lock(&pl->state_mutex);
+
+	pl->config->mac_capabilities &= ~(MAC_SYM_PAUSE | MAC_ASYM_PAUSE);
+	pl->config->mac_capabilities |= mac_pause;
+
+	phylink_set(pl->supported, Pause);
+	phylink_set(pl->supported, Asym_Pause);
+
+	if (pl->phydev)
+		linkmode_and(pl->supported, pl->supported, pl->phydev->supported);
+	else if (pl->sfp_bus)
+		linkmode_and(pl->supported, pl->supported, pl->sfp_support);
+
+	phylink_validate(pl, pl->supported, config);
+
+	pause_state = config->pause;
+
+	if (!phylink_test(pl->supported, Pause)) {
+		pause_state &= ~(MLO_PAUSE_RX | MLO_PAUSE_TX);
+	} else if (!phylink_test(pl->supported, Asym_Pause)) {
+		if ((pause_state & MLO_PAUSE_RX) ^ (pause_state & MLO_PAUSE_TX))
+			pause_state &= ~(MLO_PAUSE_RX | MLO_PAUSE_TX);
+	}
+
+	mutex_unlock(&pl->state_mutex);
+
+	phylink_update_pause_state(pl, pause_state);
+}
+EXPORT_SYMBOL_GPL(phylink_update_mac_pause_capabilities);
 
 /**
  * phylink_create() - create a phylink instance
@@ -3213,8 +3335,6 @@ EXPORT_SYMBOL_GPL(phylink_ethtool_get_pauseparam);
 int phylink_ethtool_set_pauseparam(struct phylink *pl,
 				   struct ethtool_pauseparam *pause)
 {
-	struct phylink_link_state *config = &pl->link_config;
-	bool manual_changed;
 	int pause_state;
 
 	ASSERT_RTNL();
@@ -3238,54 +3358,7 @@ int phylink_ethtool_set_pauseparam(struct phylink *pl,
 	if (pause->tx_pause)
 		pause_state |= MLO_PAUSE_TX;
 
-	mutex_lock(&pl->state_mutex);
-	/*
-	 * See the comments for linkmode_set_pause(), wrt the deficiencies
-	 * with the current implementation.  A solution to this issue would
-	 * be:
-	 * ethtool  Local device
-	 *  rx  tx  Pause AsymDir
-	 *  0   0   0     0
-	 *  1   0   1     1
-	 *  0   1   0     1
-	 *  1   1   1     1
-	 * and then use the ethtool rx/tx enablement status to mask the
-	 * rx/tx pause resolution.
-	 */
-	linkmode_set_pause(config->advertising, pause->tx_pause,
-			   pause->rx_pause);
-
-	manual_changed = (config->pause ^ pause_state) & MLO_PAUSE_AN ||
-			 (!(pause_state & MLO_PAUSE_AN) &&
-			   (config->pause ^ pause_state) & MLO_PAUSE_TXRX_MASK);
-
-	config->pause = pause_state;
-
-	/* Update our in-band advertisement, triggering a renegotiation if
-	 * the advertisement changed.
-	 */
-	if (!pl->phydev)
-		phylink_change_inband_advert(pl);
-
-	mutex_unlock(&pl->state_mutex);
-
-	/* If we have a PHY, a change of the pause frame advertisement will
-	 * cause phylib to renegotiate (if AN is enabled) which will in turn
-	 * call our phylink_phy_change() and trigger a resolve.  Note that
-	 * we can't hold our state mutex while calling phy_set_asym_pause().
-	 */
-	if (pl->phydev)
-		phy_set_asym_pause(pl->phydev, pause->rx_pause,
-				   pause->tx_pause);
-
-	/* If the manual pause settings changed, make sure we trigger a
-	 * resolve to update their state; we can not guarantee that the
-	 * link will cycle.
-	 */
-	if (manual_changed) {
-		pl->link_failed = true;
-		phylink_run_resolve(pl);
-	}
+	phylink_update_pause_state(pl, pause_state);
 
 	return 0;
 }
@@ -4388,6 +4461,57 @@ void phylink_mii_c45_pcs_get_state(struct mdio_device *pcs,
 	}
 }
 EXPORT_SYMBOL_GPL(phylink_mii_c45_pcs_get_state);
+
+/**
+ * phylink_replay_link_begin() - begin replay of link callbacks for driver
+ *				 which loses state
+ * @pl: a pointer to a &struct phylink returned from phylink_create()
+ *
+ * Helper for MAC drivers which may perform a destructive reset at runtime.
+ * Both the own driver's mac_link_down() method is called, as well as the
+ * pcs_link_down() method of the split PCS (if any).
+ *
+ * This is similar to phylink_stop(), except it does not alter the state of
+ * the phylib PHY (it is assumed that it is not affected by the MAC destructive
+ * reset).
+ */
+void phylink_replay_link_begin(struct phylink *pl)
+{
+	ASSERT_RTNL();
+
+	phylink_run_resolve_and_disable(pl, PHYLINK_DISABLE_REPLAY);
+}
+EXPORT_SYMBOL_GPL(phylink_replay_link_begin);
+
+/**
+ * phylink_replay_link_end() - end replay of link callbacks for driver
+ *			       which lost state
+ * @pl: a pointer to a &struct phylink returned from phylink_create()
+ *
+ * Helper for MAC drivers which may perform a destructive reset at runtime.
+ * Both the own driver's mac_config() and mac_link_up() methods, as well as the
+ * pcs_config() and pcs_link_up() method of the split PCS (if any), are called.
+ *
+ * This is similar to phylink_start(), except it does not alter the state of
+ * the phylib PHY.
+ *
+ * One must call this method only within the same rtnl_lock() critical section
+ * as a previous phylink_replay_link_start().
+ */
+void phylink_replay_link_end(struct phylink *pl)
+{
+	ASSERT_RTNL();
+
+	if (WARN(!test_bit(PHYLINK_DISABLE_REPLAY,
+			   &pl->phylink_disable_state),
+		 "phylink_replay_link_end() called without a prior phylink_replay_link_begin()\n"))
+		return;
+
+	pl->force_major_config = true;
+	phylink_enable_and_run_resolve(pl, PHYLINK_DISABLE_REPLAY);
+	flush_work(&pl->resolve);
+}
+EXPORT_SYMBOL_GPL(phylink_replay_link_end);
 
 static int __init phylink_init(void)
 {

@@ -29,6 +29,9 @@ static int msdos_format_name(const unsigned char *name, int len,
 	unsigned char c;
 	int space;
 
+	if (len > NAME_MAX)
+		return -ENAMETOOLONG;
+
 	if (name[0] == '.') {	/* dotfile because . and .. already done */
 		if (opts->dotsOK) {
 			/* Get rid of dot - test for it elsewhere */
@@ -290,11 +293,17 @@ static int msdos_create(struct mnt_idmap *idmap, struct inode *dir,
 	if (err)
 		goto out;
 	inode = fat_build_inode(sb, sinfo.de, sinfo.i_pos);
-	brelse(sinfo.bh);
 	if (IS_ERR(inode)) {
+		int err2;
+
 		err = PTR_ERR(inode);
+		err2 = fat_remove_entries(dir, &sinfo);
+		if (err2)
+			fat_msg(sb, KERN_WARNING,
+				"failed to roll back new entry (%d)", err2);
 		goto out;
 	}
+	brelse(sinfo.bh);
 	fat_truncate_time(inode, &ts, S_ATIME|S_CTIME|S_MTIME);
 	/* timestamp is already written, so mark_inode_dirty() is unneeded. */
 
@@ -325,12 +334,7 @@ static int msdos_rmdir(struct inode *dir, struct dentry *dentry)
 	err = fat_remove_entries(dir, &sinfo);	/* and releases bh */
 	if (err)
 		goto out;
-	if (dir->i_nlink >= 3)
-		drop_nlink(dir);
-	else {
-		fat_fs_error(sb, "parent dir link count too low (%u)",
-			dir->i_nlink);
-	}
+	fat_dir_drop_nlink(dir);
 
 	clear_nlink(inode);
 	fat_truncate_time(inode, NULL, S_CTIME);
@@ -380,12 +384,20 @@ static struct dentry *msdos_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	inc_nlink(dir);
 
 	inode = fat_build_inode(sb, sinfo.de, sinfo.i_pos);
-	brelse(sinfo.bh);
 	if (IS_ERR(inode)) {
+		int err2;
+
 		err = PTR_ERR(inode);
-		/* the directory was completed, just return a error */
-		goto out;
+		err2 = fat_remove_entries(dir, &sinfo);
+		if (err2) {
+			fat_msg(sb, KERN_WARNING,
+				"failed to roll back new entry (%d)", err2);
+			goto out;
+		}
+		drop_nlink(dir);
+		goto out_free;
 	}
+	brelse(sinfo.bh);
 	set_nlink(inode, 2);
 	fat_truncate_time(inode, &ts, S_ATIME|S_CTIME|S_MTIME);
 	/* timestamp is already written, so mark_inode_dirty() is unneeded. */
@@ -552,6 +564,8 @@ static int do_msdos_rename(struct inode *old_dir, unsigned char *old_name,
 		mark_inode_dirty(old_dir);
 
 	if (new_inode) {
+		if (is_dir && old_dir == new_dir)
+			fat_dir_drop_nlink(old_dir);
 		drop_nlink(new_inode);
 		if (is_dir)
 			drop_nlink(new_inode);

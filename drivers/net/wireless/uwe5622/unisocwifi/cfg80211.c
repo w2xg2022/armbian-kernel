@@ -714,7 +714,31 @@ static int sprdwl_add_cipher_key(struct sprdwl_vif *vif, bool pairwise,
 	return ret;
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 60)
+static int sprdwl_cfg80211_add_key(struct wiphy *wiphy, struct wireless_dev *wdev,
+				   int link_id, u8 key_index,
+				   enum nl80211_key_type type,
+				   const u8 *mac_addr,
+				   struct key_params *params)
+{
+	struct sprdwl_vif *vif = netdev_priv(wdev->netdev);
+	bool pairwise = (type == NL80211_KEYTYPE_PAIRWISE);
+
+	vif->key_index[pairwise] = key_index;
+	vif->key_len[pairwise][key_index] = params->key_len;
+	memcpy(vif->key[pairwise][key_index], params->key, params->key_len);
+
+	/* PMK is for Roaming offload */
+	if (params->cipher == WLAN_CIPHER_SUITE_PMK)
+		return sprdwl_set_roam_offload(vif->priv, vif->ctx_id,
+					       SPRDWL_ROAM_OFFLOAD_SET_PMK,
+					       params->key, params->key_len);
+	else
+		return sprdwl_add_cipher_key(vif, pairwise, key_index,
+					     params->cipher, params->seq,
+					     mac_addr);
+}
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
 static int sprdwl_cfg80211_add_key(struct wiphy *wiphy, struct wireless_dev *wdev,
 				   int link_id, u8 key_index, bool pairwise,
 				   const u8 *mac_addr,
@@ -782,7 +806,38 @@ static int sprdwl_cfg80211_add_key(struct wiphy *wiphy, struct net_device *ndev,
 }
 #endif
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 60)
+static int sprdwl_cfg80211_del_key(struct wiphy *wiphy, struct wireless_dev *wdev,
+				   int link_id, u8 key_index,
+				   enum nl80211_key_type type,
+				   const u8 *mac_addr)
+{
+	struct sprdwl_vif *vif = netdev_priv(wdev->netdev);
+	bool pairwise = (type == NL80211_KEYTYPE_PAIRWISE);
+
+	wl_ndev_log(L_DBG, vif->ndev, "%s key_index=%d, pairwise=%d\n",
+		    __func__, key_index, pairwise);
+
+	if (key_index > SPRDWL_MAX_KEY_INDEX) {
+		wl_ndev_log(L_ERR, vif->ndev, "%s key index %d out of bounds!\n", __func__,
+			   key_index);
+		return -ENOENT;
+	}
+
+	if (!vif->key_len[pairwise][key_index]) {
+		wl_ndev_log(L_ERR, vif->ndev, "%s key index %d is empty!\n", __func__,
+			   key_index);
+		return 0;
+	}
+
+	vif->key_len[pairwise][key_index] = 0;
+	vif->prwise_crypto = SPRDWL_CIPHER_NONE;
+	vif->grp_crypto = SPRDWL_CIPHER_NONE;
+
+	return sprdwl_del_key(vif->priv, vif->ctx_id, key_index,
+			      pairwise, mac_addr);
+}
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
 static int sprdwl_cfg80211_del_key(struct wiphy *wiphy, struct wireless_dev *wdev,
 				   int link_id, u8 key_index, bool pairwise,
 				   const u8 *mac_addr)
@@ -3854,15 +3909,25 @@ static void sprdwl_reg_notify(struct wiphy *wiphy,
 		for (channel = 0; channel < sband->n_channels; channel++) {
 			chan = &sband->channels[channel];
 
-			reg_rule =
-			    freq_reg_info(wiphy, MHZ_TO_KHZ(chan->center_freq));
-			if (IS_ERR(reg_rule))
-				continue;
+			/*
+			 * freq_reg_info() walks wiphy->regd, which is RCU
+			 * protected, and the returned rule points into that
+			 * regdomain. The regulatory core no longer holds the
+			 * RTNL when calling the notifier, so the lookup and
+			 * every use of the returned rule must stay inside an
+			 * RCU read-side critical section.
+			 */
+			scoped_guard(rcu) {
+				reg_rule = freq_reg_info(wiphy,
+						MHZ_TO_KHZ(chan->center_freq));
+				if (IS_ERR(reg_rule))
+					continue;
 
-			freq_range = &reg_rule->freq_range;
-			if (last_start_freq != freq_range->start_freq_khz) {
-				last_start_freq = freq_range->start_freq_khz;
-				n_rules++;
+				freq_range = &reg_rule->freq_range;
+				if (last_start_freq != freq_range->start_freq_khz) {
+					last_start_freq = freq_range->start_freq_khz;
+					n_rules++;
+				}
 			}
 
 			sprdwl_save_ch_info(priv, band, chan->flags,
@@ -3903,26 +3968,29 @@ static void sprdwl_reg_notify(struct wiphy *wiphy,
 			if (intf->sta_home_channel && chan->flags & IEEE80211_CHAN_RADAR)
 				intf->sta_home_channel = 0;
 #endif
-			reg_rule =
-			    freq_reg_info(wiphy, MHZ_TO_KHZ(chan->center_freq));
-			if (IS_ERR(reg_rule))
-				continue;
+			/* see the comment on the first lookup above */
+			scoped_guard(rcu) {
+				reg_rule = freq_reg_info(wiphy,
+						MHZ_TO_KHZ(chan->center_freq));
+				if (IS_ERR(reg_rule))
+					continue;
 
-			freq_range = &reg_rule->freq_range;
-			if (last_start_freq != freq_range->start_freq_khz &&
-			    i < n_rules) {
-				last_start_freq = freq_range->start_freq_khz;
+				freq_range = &reg_rule->freq_range;
+				if (last_start_freq != freq_range->start_freq_khz &&
+				    i < n_rules) {
+					last_start_freq = freq_range->start_freq_khz;
 
-				memcpy(&rd->reg_rules[i], reg_rule,
-				       sizeof(struct ieee80211_reg_rule));
-				i++;
+					memcpy(&rd->reg_rules[i], reg_rule,
+					       sizeof(struct ieee80211_reg_rule));
+					i++;
 
-				wl_info(
-					  "%d KHz - %d KHz @ %d KHz flags %#x, chan->flags:%x\n",
-					  freq_range->start_freq_khz,
-					  freq_range->end_freq_khz,
-					  freq_range->max_bandwidth_khz,
-					  reg_rule->flags, chan->flags);
+					wl_info(
+						  "%d KHz - %d KHz @ %d KHz flags %#x, chan->flags:%x\n",
+						  freq_range->start_freq_khz,
+						  freq_range->end_freq_khz,
+						  freq_range->max_bandwidth_khz,
+						  reg_rule->flags, chan->flags);
+				}
 			}
 		}
 	}

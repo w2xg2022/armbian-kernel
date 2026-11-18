@@ -140,7 +140,13 @@ mtk_cfg80211_change_iface(struct wiphy *wiphy,
 int
 mtk_cfg80211_add_key(struct wiphy *wiphy,
 		     struct wireless_dev *wdev,
-		     int link_id, u8 key_index, bool pairwise, const u8 *mac_addr, struct key_params *params)
+		     int link_id, u8 key_index,
+#if KERNEL_VERSION(6, 18, 60) <= CFG80211_VERSION_CODE
+		     enum nl80211_key_type type,
+#else
+		     bool pairwise,
+#endif
+		     const u8 *mac_addr, struct key_params *params)
 {
 	PARAM_KEY_T rKey;
 	P_GLUE_INFO_T prGlueInfo = NULL;
@@ -148,6 +154,9 @@ mtk_cfg80211_add_key(struct wiphy *wiphy,
 	INT_32 i4Rslt = -EINVAL;
 	UINT_32 u4BufLen = 0;
 	UINT_8 tmp1[8], tmp2[8];
+#if KERNEL_VERSION(6, 18, 60) <= CFG80211_VERSION_CODE
+	bool pairwise = (type == NL80211_KEYTYPE_PAIRWISE);
+#endif
 #if CFG_SUPPORT_REPLAY_DETECTION
 	P_BSS_INFO_T prBssInfo = NULL;
 	struct SEC_DETECT_REPLAY_INFO *prDetRplyInfo = NULL;
@@ -300,7 +309,11 @@ mtk_cfg80211_get_key(struct wiphy *wiphy,
 		     struct wireless_dev *wdev,
 		     int link_id,
 		     u8 key_index,
+#if KERNEL_VERSION(6, 18, 60) <= CFG80211_VERSION_CODE
+		     enum nl80211_key_type type,
+#else
 		     bool pairwise,
+#endif
 		     const u8 *mac_addr, void *cookie, void (*callback) (void *cookie, struct key_params *)
 )
 {
@@ -328,13 +341,22 @@ mtk_cfg80211_get_key(struct wiphy *wiphy,
  *         others:  failure
  */
 /*----------------------------------------------------------------------------*/
-int mtk_cfg80211_del_key(struct wiphy *wiphy, struct wireless_dev *wdev, int link_id, u8 key_index, bool pairwise, const u8 *mac_addr)
+int mtk_cfg80211_del_key(struct wiphy *wiphy, struct wireless_dev *wdev, int link_id, u8 key_index,
+#if KERNEL_VERSION(6, 18, 60) <= CFG80211_VERSION_CODE
+			 enum nl80211_key_type type,
+#else
+			 bool pairwise,
+#endif
+			 const u8 *mac_addr)
 {
 	P_GLUE_INFO_T prGlueInfo = NULL;
 	WLAN_STATUS rStatus = WLAN_STATUS_SUCCESS;
 	PARAM_REMOVE_KEY_T rRemoveKey;
 	UINT_32 u4BufLen = 0;
 	INT_32 i4Rslt = -EINVAL;
+#if KERNEL_VERSION(6, 18, 60) <= CFG80211_VERSION_CODE
+	bool pairwise __maybe_unused = (type == NL80211_KEYTYPE_PAIRWISE);
+#endif
 
 	prGlueInfo = (P_GLUE_INFO_T) wiphy_priv(wiphy);
 	ASSERT(prGlueInfo);
@@ -3252,9 +3274,20 @@ enum regd_state regd_state_machine(IN struct regulatory_request *pRequest)
 	}
 }
 
+/*
+ * @wiphy_locked: true when the caller already holds the wiphy mutex, which is
+ *	the case when cfg80211 invokes the reg_notifier.
+ *
+ * wiphy_apply_custom_regulatory() takes the wiphy mutex internally, and that
+ * mutex is not recursive, so it cannot be used from the notifier. Reimplement
+ * the same steps here instead: the channel flags are updated directly (they
+ * are only touched under the wiphy mutex, which the notifier already holds),
+ * and the regdomain pointer is swapped with RCU.
+ */
 void
 mtk_apply_custom_regulatory(IN struct wiphy *pWiphy,
-							IN const struct ieee80211_regdomain *pRegdom)
+							IN const struct ieee80211_regdomain *pRegdom,
+							IN bool wiphy_locked)
 {
 	u32 band_idx, ch_idx;
 	struct ieee80211_supported_band *sband;
@@ -3278,7 +3311,40 @@ mtk_apply_custom_regulatory(IN struct wiphy *pWiphy,
 	}
 
 	/* update to kernel */
+#if KERNEL_VERSION(6, 18, 60) <= CFG80211_VERSION_CODE
+	if (!wiphy_locked) {
+		wiphy_apply_custom_regulatory(pWiphy, pRegdom);
+	} else {
+		/*
+		 * Same effect as wiphy_apply_custom_regulatory(), but without
+		 * taking the wiphy mutex again. reg_copy_regd() and
+		 * rcu_free_regdom() are not exported, so do it inline.
+		 */
+		struct ieee80211_regdomain *new_regd;
+		const struct ieee80211_regdomain *old_regd;
+
+		new_regd = kzalloc(struct_size(new_regd, reg_rules,
+					       pRegdom->n_reg_rules),
+				   GFP_KERNEL);
+		if (!new_regd)
+			return;
+
+		memcpy(new_regd, pRegdom, sizeof(struct ieee80211_regdomain));
+		memcpy(new_regd->reg_rules, pRegdom->reg_rules,
+		       pRegdom->n_reg_rules *
+		       sizeof(struct ieee80211_reg_rule));
+
+		pWiphy->regulatory_flags |= REGULATORY_CUSTOM_REG;
+
+		old_regd = get_wiphy_regdom(pWiphy);
+		rcu_assign_pointer(pWiphy->regd, new_regd);
+		if (old_regd)
+			kfree_rcu((struct ieee80211_regdomain *)old_regd,
+				  rcu_head);
+	}
+#else
 	wiphy_apply_custom_regulatory(pWiphy, pRegdom);
+#endif
 }
 
 void
@@ -3422,7 +3488,11 @@ DOMAIN_SEND_CMD:
 			return;
 		}
 
-		mtk_apply_custom_regulatory(pWiphy, pRegdom);
+		/*
+		 * mtk_reg_notify() is invoked by cfg80211 with the wiphy
+		 * mutex held, so tell the helper not to take it again.
+		 */
+		mtk_apply_custom_regulatory(pWiphy, pRegdom, true);
 	}
 
 	/*

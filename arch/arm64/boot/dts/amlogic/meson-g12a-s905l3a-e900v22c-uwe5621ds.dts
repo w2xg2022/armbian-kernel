@@ -1,0 +1,143 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * E900V22C: give sd_emmc_b entirely to the UWE5621DS Wi-Fi module.
+ *
+ * The box has no SD card slot, so the time-sliced sharing used by the
+ * tdma variant is not needed. sd_emmc_b has no mmc-slot child here and
+ * acts as the one and only slot, without any bus arbitration. The module
+ * is wired to the GPIOX SDIO pads, which sd_emmc_b reaches through the
+ * virtual sdio_dummy mux. The GPIOC pads (the unused SD card pads) are
+ * parked as GPIOs.
+ */
+/dts-v1/;
+
+#include "meson-g12a-s905l3a-e900v22c.dts"
+
+/* 32.768 kHz sleep clock for the module (wifi32k), from the crystal. */
+&pwm_ef {
+	clocks = <&xtal>;
+	pinctrl-0 = <&pwm_e_pins>;
+	pinctrl-names = "default";
+	status = "okay";
+};
+
+&periphs_pinctrl {
+	sdio_b_pins: sdio-b {
+		mux-sd-clear-data {
+			groups = "GPIOC_0", "GPIOC_1", "GPIOC_2",
+				 "GPIOC_3", "GPIOC_5";
+			function = "gpio_periphs";
+			output-high;
+		};
+
+		mux-sd-clear-clock {
+			groups = "GPIOC_4";
+			function = "gpio_periphs";
+			output-low;
+		};
+
+		mux-data {
+			groups = "GPIOX_0", "GPIOX_1", "GPIOX_2",
+				 "GPIOX_3", "GPIOX_5";
+			function = "gpio_periphs";
+			input-enable;
+			bias-pull-up;
+			drive-strength-microamp = <4000>;
+		};
+
+		mux-clock {
+			groups = "GPIOX_4";
+			function = "gpio_periphs";
+			bias-pull-up;
+			output-high;
+			drive-strength-microamp = <4000>;
+		};
+
+		mux-route {
+			groups = "sdio_dummy";
+			function = "sdio";
+			bias-pull-up;
+			output-high;
+		};
+	};
+
+	sdio_b_clk_gate_pins: sdio-b-clk-gate {
+		mux-sd-clear-data {
+			groups = "GPIOC_0", "GPIOC_1", "GPIOC_2",
+				 "GPIOC_3", "GPIOC_5";
+			function = "gpio_periphs";
+			output-high;
+		};
+
+		mux-sd-clear-clock {
+			groups = "GPIOC_4";
+			function = "gpio_periphs";
+			output-low;
+		};
+
+		mux-command {
+			groups = "GPIOX_5";
+			function = "gpio_periphs";
+			input-enable;
+			bias-pull-up;
+			drive-strength-microamp = <4000>;
+		};
+
+		mux-clock {
+			groups = "GPIOX_4";
+			function = "gpio_periphs";
+			bias-pull-up;
+			output-high;
+			drive-strength-microamp = <4000>;
+		};
+
+		mux-route {
+			groups = "sdio_dummy";
+			function = "sdio";
+			bias-pull-up;
+			output-high;
+		};
+	};
+};
+
+/* The GPIOX pads now belong to sd_emmc_b. */
+&sd_emmc_a {
+	status = "disabled";
+};
+
+/* UWE5621DS Wi-Fi, the only device on this controller */
+&sd_emmc_b {
+	pinctrl-0 = <&sdio_b_pins>;
+	pinctrl-1 = <&sdio_b_clk_gate_pins>;
+	pinctrl-names = "default", "clk-gate";
+	/* No SD card here: drop the card-detect pin inherited from the u200 base. */
+	/delete-property/ cd-gpios;
+	#address-cells = <1>;
+	#size-cells = <0>;
+	status = "okay";
+
+	bus-width = <4>;
+	cap-sd-highspeed;
+	cap-sdio-irq;
+	sd-uhs-sdr50;
+	sd-uhs-sdr104;
+	/* Android runs the module at 166 MHz; 200 MHz is not validated. */
+	max-frequency = <166666667>;
+	/* The vendor power driver holds the module in reset for ~321 ms. */
+	post-power-on-delay-ms = <300>;
+
+	non-removable;
+	disable-wp;
+	keep-power-in-suspend;
+	/* The GPIOX pads run from a fixed 1.8 V rail: skip the CMD11 switch. */
+	zte,sdio-fixed-1-8v;
+
+	mmc-pwrseq = <&sdio_pwrseq>;
+	vmmc-supply = <&vddao_3v3>;
+	vqmmc-supply = <&vddao_1v8>;
+
+	wifi@1 {
+		compatible = "sprd,unisoc-wifi";
+		reg = <1>;
+	};
+};

@@ -27,8 +27,8 @@
 	/*
 	 * The status LED sits on GPIOAO_11, which is multiplexed with PWM_AO_A.
 	 * Drive it through the PWM so its brightness can be adjusted at runtime
-	 * (0-255) via /sys/class/leds/blue:status/brightness. No default
-	 * brightness is forced; the LED core switches it off on shutdown.
+	 * (0-255) via /sys/class/leds/blue:status/brightness. It starts on at
+	 * brightness 100; the LED core switches it off on shutdown.
 	 */
 	pwm-leds {
 		compatible = "pwm-leds";
@@ -38,7 +38,8 @@
 			function = LED_FUNCTION_STATUS;
 			pwms = <&pwm_AO_ab 0 1000000 0>;
 			max-brightness = <255>;
-			linux,default-trigger = "heartbeat";
+			default-state = "on";
+			default-brightness = <100>;
 			panic-indicator;
 		};
 	};
